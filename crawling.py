@@ -58,128 +58,250 @@ class PageParser:
         }
 
     def _parse_dom(self) -> dict:
-        """Extracts DOM-related information."""
+        """Extracts DOM-related information in LLM-compatible format."""
         # 1. Title
         title = self.soup.title.string.strip() if self.soup.title else ""
 
-        # 2. Meta tags
-        meta_tags = []
+        # 2. Meta tags - extract generator specifically and convert to dict format
+        meta_dict = {}
         for tag in self.soup.find_all("meta"):
-            meta_tags.append({
-                "name": tag.get("name"),
-                "property": tag.get("property"),
-                "content": tag.get("content"),
-            })
+            name = tag.get("name") or tag.get("property")
+            content = tag.get("content")
+            if name and content:
+                if name.lower() == "generator":
+                    meta_dict["generator"] = content
+                else:
+                    meta_dict[name] = content
 
         # 3. Scripts & Links (CSS)
-        def parse_url(u):
-            parsed = urlparse(urljoin(self.base_url, u))
-            return {
-                "full": parsed.geturl(),
-                "path": parsed.path,
-                "query": parse_qs(parsed.query)
-            }
         scripts = [urljoin(self.base_url, s.get('src')) for s in self.soup.find_all('script') if s.get('src')]
         links = [urljoin(self.base_url, l.get('href')) for l in self.soup.find_all('link') if l.get('href')]
 
         # 4. Visible Links
         visible_links = [urljoin(self.base_url, a.get('href')) for a in self.soup.find_all('a') if a.get('href')]
         
-        # 5. Forms
+        # 5. Forms - format to match LLM spec
         forms = []
         for form in self.soup.find_all('form'):
-            forms.append({
+            form_data = {
                 "action": urljoin(self.base_url, form.get('action', '')),
                 "method": form.get('method', 'GET').upper(),
+                "enctype": form.get('enctype', 'application/x-www-form-urlencoded'),
                 "inputs": [i.get('name') for i in form.find_all('input') if i.get('name')]
-            })
+            }
+            forms.append(form_data)
             
-        # 6. Comments and Text Leaks
+        # 6. Comments and Text Leaks - format as structured objects
         comments = self.soup.find_all(string=lambda text: isinstance(text, Comment))
         text_content = self.soup.get_text()
-        text_leaks = re.findall(r'(?i)(API_KEY[\s=:]+[\w-]+|DEBUG\s*=\s*True|Exception:|Warning:)', text_content)
+        
+        comments_or_text_leaks = []
+        # Add HTML comments
+        for comment in comments:
+            comment_text = comment.strip()
+            if comment_text:
+                comments_or_text_leaks.append({
+                    "type": "html_comment", 
+                    "snippet": comment_text[:200]
+                })
+        
+        # Look for various types of leaks
+        api_keys = re.findall(r'(?i)API[_\s]*KEY[\s=:]+([a-zA-Z0-9\-_]{20,})', text_content)
+        for key in api_keys:
+            comments_or_text_leaks.append({
+                "type": "api_key",
+                "snippet": f"API_KEY={key[:10]}..."
+            })
+            
+        debug_flags = re.findall(r'(?i)DEBUG\s*=\s*(true|1|yes)', text_content)
+        for flag in debug_flags:
+            comments_or_text_leaks.append({
+                "type": "debug",
+                "snippet": f"DEBUG={flag}"
+            })
+            
+        stack_traces = re.findall(r'(?i)(PHP Warning:|Exception:|Error:|Traceback)', text_content)
+        for trace in stack_traces:
+            comments_or_text_leaks.append({
+                "type": "stack",
+                "snippet": trace
+            })
 
         return {
             "title": title,
-            "meta": meta_tags,
+            "meta": meta_dict,
             "scripts": scripts,
             "links": links,
-            "visible_links": list(set(visible_links)),
+            "comments_or_text_leaks": comments_or_text_leaks,
             "forms": forms,
-            "comments_or_text_leaks": list(set(comments + text_leaks)),
-            "visible_text_sample": ' '.join(text_content.split())[:500] + "..."
+            "visible_links": list(set(visible_links)),
+            "visible_text_sample": ' '.join(text_content.split())[:500] + ("..." if len(text_content) > 500 else "")
         }
 
     def _parse_fingerprints(self) -> dict:
-        """Extracts web technology and CMS information."""
+        """Extracts web technology and CMS information in LLM-compatible format."""
         fingerprints = {"cms": [], "plugins": [], "tech": []}
         page_content = str(self.soup)
 
-        # CMS (WordPress, etc.)
-        if self.soup.find('meta', {'name': 'generator'}):
-            fingerprints["cms"].append(self.soup.find('meta', {'name': 'generator'}).get('content'))
-        if "/wp-content/" in page_content or "/wp-includes/" in page_content:
-            fingerprints["cms"].append("WordPress")
-            
-        # Plugins (e.g., WordPress version strings)
-        version_pattern = re.compile(r'[\?&](ver|v)=(\d+\.[\d\.]+)')
-        for url in self._parse_dom()['scripts'] + self._parse_dom()['links']:
-            match = version_pattern.search(url)
-            if match:
-                fingerprints["plugins"].append(f"{url.split('?')[0].split('/')[-1]}? (v{match.group(2)})")
+        # CMS Detection
+        generator_meta = self.soup.find('meta', {'name': 'generator'})
+        if generator_meta:
+            generator_content = generator_meta.get('content', '')
+            if "wordpress" in generator_content.lower():
+                # Extract version if present
+                version_match = re.search(r'(\d+\.\d+(?:\.\d+)?)', generator_content)
+                if version_match:
+                    fingerprints["cms"].append(f"wordpress {version_match.group(1)}")
+                else:
+                    fingerprints["cms"].append("wordpress")
+            else:
+                fingerprints["cms"].append(generator_content.lower())
         
-        # Tech
+        # Additional WordPress detection
+        if "/wp-content/" in page_content or "/wp-includes/" in page_content:
+            if not any("wordpress" in cms for cms in fingerprints["cms"]):
+                fingerprints["cms"].append("wordpress")
+            
+        # Plugin Detection - get script and link URLs directly
+        scripts = [urljoin(self.base_url, s.get('src')) for s in self.soup.find_all('script') if s.get('src')]
+        links = [urljoin(self.base_url, l.get('href')) for l in self.soup.find_all('link') if l.get('href')]
+        
+        version_pattern = re.compile(r'[\?&](ver|v)=(\d+\.[\d\.]+)')
+        plugin_urls = scripts + links
+        
+        for url in plugin_urls:
+            # WordPress plugins
+            wp_plugin_match = re.search(r'/wp-content/plugins/([^/]+)/', url)
+            if wp_plugin_match:
+                plugin_name = wp_plugin_match.group(1)
+                version_match = version_pattern.search(url)
+                if version_match:
+                    fingerprints["plugins"].append({
+                        "name": plugin_name, 
+                        "version": version_match.group(2)
+                    })
+                else:
+                    fingerprints["plugins"].append({
+                        "name": plugin_name, 
+                        "version": "unknown"
+                    })
+        
+        # Technology Detection
         if "jquery.js" in page_content or "jQuery" in page_content:
-            fingerprints["tech"].append("jQuery")
-        if any(".php?id=" in a for a in self._parse_dom()['visible_links']):
-            fingerprints["tech"].append("PHP?")
+            fingerprints["tech"].append("jquery")
+            
+        # Check for PHP indicators
+        php_indicators = [".php", "PHPSESSID"]
+        if any(indicator in page_content for indicator in php_indicators):
+            fingerprints["tech"].append("php")
+            
+        # Apache detection
+        server_headers = self.soup.find_all('meta', {'name': 'server'})
+        for header in server_headers:
+            content = header.get('content', '').lower()
+            if 'apache' in content:
+                fingerprints["tech"].append("apache?")
+                break
 
         return fingerprints
 
     def _parse_panel_login_signals(self) -> dict:
-        """Finds clues related to login/admin pages."""
-        signals = {"candidate_urls": [], "keywords_found": []}
-        login_patterns = ['/admin', '/login', '/signin', '/manager', '/wp-login.php']
-        keyword_patterns = re.compile(r'(?i)(Login|Admin|Sign In|Dashboard)')
+        """Finds clues related to login/admin pages in LLM-compatible format."""
+        login_patterns = ['/admin', '/login', '/signin', '/manager', '/wp-login.php', '/administrator', '/dashboard']
+        keyword_patterns = re.compile(r'(?i)(login|admin|sign[\s\-]*in|dashboard|control[\s\-]*panel|management)')
 
-        # Detect URL patterns
-        for link in self._parse_dom()['visible_links']:
-            for pattern in login_patterns:
-                if pattern in link:
-                    signals["candidate_urls"].append(link)
+        # Get visible links directly
+        visible_links = [urljoin(self.base_url, a.get('href')) for a in self.soup.find_all('a') if a.get('href')]
         
-        # Detect text keywords
-        text_to_search = self._parse_dom()['title'] + " " + " ".join(h.get_text() for h in self.soup.find_all(['h1', 'h2', 'h3']))
-        found_keywords = keyword_patterns.findall(text_to_search)
-        if found_keywords:
-            signals["keywords_found"].extend(found_keywords)
+        # Detect URL patterns in visible links
+        candidates = []
+        for link in visible_links:
+            for pattern in login_patterns:
+                if pattern.lower() in link.lower():
+                    candidates.append(link)
+        
+        # Check if current page looks admin-like based on title and headers
+        title = self.soup.title.string.strip() if self.soup.title else ""
+        header_text = " ".join(h.get_text() for h in self.soup.find_all(['h1', 'h2', 'h3']))
+        text_to_search = title + " " + header_text
+        
+        is_admin_like = bool(keyword_patterns.search(text_to_search))
+        
+        # Add current page forms that might be login forms
+        for form in self.soup.find_all('form'):
+            inputs = [i.get('name') for i in form.find_all('input') if i.get('name')]
+            # Check for typical login form inputs
+            has_password = any('password' in inp.lower() for inp in inputs)
+            has_user_field = any(field in inp.lower() for inp in inputs for field in ['user', 'email', 'login'])
+            
+            if has_password and has_user_field:
+                action = urljoin(self.base_url, form.get('action', ''))
+                if action and action not in candidates:
+                    candidates.append(action)
 
-        signals["candidate_urls"] = list(set(signals["candidate_urls"]))
-        return signals
+        return {
+            "is_admin_like": is_admin_like,
+            "candidates": list(set(candidates))
+        }
 
     def _parse_osint_exposure(self) -> dict:
-        """Detects exposure of personal info, cloud resources, etc. (OSINT)."""
-        exposures = {"emails": [], "cloud_links": [], "social_links": [], "open_directory": []}
+        """Detects exposure of personal info, cloud resources, etc. (OSINT) in LLM-compatible format."""
         text_content = self.soup.get_text()
-        links = self._parse_dom()['visible_links']
+        # Get visible links directly
+        links = [urljoin(self.base_url, a.get('href')) for a in self.soup.find_all('a') if a.get('href')]
 
-        # Emails
-        exposures["emails"] = list(set(re.findall(r'[\w\.-]+@[\w\.-]+', text_content)))
+        # Email extraction with validation
+        email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+        emails = list(set(email_pattern.findall(text_content)))
 
-        # Cloud and Social Media links
-        cloud_patterns = ['s3.amazonaws.com', 'storage.googleapis.com', 'blob.core.windows.net']
-        social_patterns = ['twitter.com/', 'facebook.com/', 'linkedin.com/', 'instagram.com/']
+        # Phone numbers
+        phone_pattern = re.compile(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
+        phones = list(set(phone_pattern.findall(text_content)))
+
+        # Social media links
+        social_patterns = {
+            'twitter.com': 'twitter',
+            'facebook.com': 'facebook', 
+            'linkedin.com': 'linkedin',
+            'instagram.com': 'instagram',
+            'github.com': 'github',
+            'youtube.com': 'youtube'
+        }
+        socials = []
         for link in links:
-            if any(p in link for p in cloud_patterns):
-                exposures["cloud_links"].append(link)
-            if any(p in link for p in social_patterns):
-                exposures["social_links"].append(link)
+            for pattern, platform in social_patterns.items():
+                if pattern in link.lower():
+                    socials.append(link)
+                    break
 
-        # Open Directory
-        if self.soup.find('a', string=re.compile(r'Index of /')):
-             exposures["open_directory"].append(self.base_url)
+        # Cloud storage links
+        cloud_patterns = ['s3.amazonaws.com', 'storage.googleapis.com', 'blob.core.windows.net', 
+                         'dropbox.com', 'drive.google.com', 'onedrive.live.com']
+        cloud_links = []
+        for link in links:
+            if any(pattern in link.lower() for pattern in cloud_patterns):
+                cloud_links.append(link)
 
-        return exposures
+        # Open directory detection
+        open_directory_ui = []
+        # Check for Apache directory listing
+        if self.soup.find('title', string=re.compile(r'Index of')):
+            open_directory_ui.append(self.base_url)
+        # Check for common directory listing patterns
+        if self.soup.find('a', string=re.compile(r'Parent Directory')):
+            open_directory_ui.append(self.base_url)
+        # Look for URLs that end with / and might be directories
+        for link in links:
+            if link.endswith('/') and any(indicator in link.lower() for indicator in ['/public/', '/files/', '/uploads/', '/documents/']):
+                open_directory_ui.append(link)
+
+        return {
+            "emails": emails,
+            "phones": phones,
+            "socials": socials,
+            "open_directory_ui": list(set(open_directory_ui)),
+            "cloud_links": cloud_links
+        }
 
 
 # --- Main Crawler Function ---
@@ -187,6 +309,7 @@ def crawl_and_parse(api_input: dict) -> dict:
     """
     Takes an API input, performs crawling and parsing, and returns the result.
     """
+    parent_guid = api_input["parent_guid"]
     target_url = api_input["target_url"]
     cookies = api_input.get("cookies", {})
     max_depth = api_input.get("max_depth", 0)
@@ -212,15 +335,34 @@ def crawl_and_parse(api_input: dict) -> dict:
 
         # 4. Pass the page source to the parser for analysis
         page_source = driver.page_source
+        print(f"[DEBUG] Page source length: {len(page_source)}")
+        print(f"[DEBUG] Page source preview: {page_source[:500]}")
+        
         parser = PageParser(base_url=driver.current_url, page_source=page_source)
         parsed_data = parser.parse_all()
+        print(f"[DEBUG] Parsed data keys: {list(parsed_data.keys())}")
+        print(f"[DEBUG] DOM data: {parsed_data.get('dom', {})}")
+        print(f"[DEBUG] Fingerprints: {parsed_data.get('fingerprints', {})}")
 
-        # 5. Consolidate results
+        # 5. Consolidate results in LLM-compatible format
         result = {
-            "request_info": {"target_url": target_url, "max_depth": max_depth},
-            "browser_data": browser_data,
-            "parsed_data": parsed_data,
+            "url": driver.current_url,  # Use final URL after redirects
+            "dom": parsed_data.get("dom", {}),
+            "fingerprints": parsed_data.get("fingerprints", {}),
+            "panel_login_signals": parsed_data.get("panel_login_signals", {}),
+            "osint_exposure": parsed_data.get("osint_exposure", {}),
+            # Keep internal metadata for controller processing
+            "_internal": {
+                "request_info": {
+                    "parent_guid": parent_guid,
+                    "target_url": target_url,
+                    "final_url": driver.current_url,
+                    "max_depth": max_depth
+                },
+                "browser_data": browser_data
+            }
         }
+        print(f"[DEBUG] Final result structure: {json.dumps(result, indent=2, default=str)}")
 
     except Exception as e:
         print(f"An error occurred during crawling {target_url}: {e}")

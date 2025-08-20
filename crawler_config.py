@@ -2,10 +2,24 @@ from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 import re
 import tempfile
 import datetime
-from seleniumwire import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
+from typing import Any, Dict
+
+# Temporarily disable selenium-wire due to compatibility issues
+SELENIUM_WIRE_AVAILABLE = False
+print("[crawler] selenium-wire temporarily disabled; using plain selenium (network capture limited).")
+from selenium import webdriver as _plain_webdriver  # type: ignore
+
+# Unified alias so later annotations/logic can refer to webdriver safely
+try:
+    if SELENIUM_WIRE_AVAILABLE:
+        webdriver = _wire_webdriver  # type: ignore
+    else:
+        webdriver = _plain_webdriver  # type: ignore
+except NameError:
+    pass
 
 class CrawlerConfig:
     """
@@ -64,34 +78,43 @@ class CrawlerConfig:
 # --- Utility Functions ---
 
 # 3-1. Cache/Storage Strategy
-def setup_driver_session(config: CrawlerConfig) -> tuple[webdriver.Chrome, str]:
+def setup_driver_session(config: CrawlerConfig):
     """
     Sets up a new Selenium-Wire WebDriver instance with an isolated profile.
     """
-    user_data_dir = tempfile.mkdtemp()
+    # Ensure a uniquely named profile dir (Chrome in containers sometimes misdetect reuse)
+    user_data_dir = tempfile.mkdtemp(prefix="shield4u_chrome_")
     print(f"Created temporary user data directory for session: {user_data_dir}")
 
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")  # mitigate /dev/shm size limits
+    chrome_options.add_argument("--disable-setuid-sandbox")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--disable-default-apps")
+    chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
     chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
     
-    # Options for selenium-wire
-    seleniumwire_options = {
-        'ignore_http_methods': ['OPTIONS', 'HEAD'], # Don't capture pre-flight requests
-        'disable_capture': False
-    }
-
     service = Service(ChromeDriverManager().install())
-    # Use seleniumwire's webdriver.Chrome
-    driver = webdriver.Chrome(service=service, options=chrome_options, seleniumwire_options=seleniumwire_options)
+    if SELENIUM_WIRE_AVAILABLE:
+        seleniumwire_options = {
+            'ignore_http_methods': ['OPTIONS', 'HEAD'],
+            'disable_capture': False,
+        }
+        driver = _wire_webdriver.Chrome(service=service, options=chrome_options, seleniumwire_options=seleniumwire_options)
+    else:
+        driver = _plain_webdriver.Chrome(service=service, options=chrome_options)
     
     return driver, user_data_dir
 
 # 6-1. Data Collection Items (Browser/Network Level)
-def collect_browser_data(driver: webdriver.Chrome, initial_url: str, config: CrawlerConfig) -> dict:
+def collect_browser_data(driver: Any, initial_url: str, config: CrawlerConfig) -> Dict[str, Any]:
     """
     Collects data that can only be gathered from the browser/network level,
     not from static HTML parsing.
@@ -109,17 +132,24 @@ def collect_browser_data(driver: webdriver.Chrome, initial_url: str, config: Cra
     data["meta"]["title"] = driver.title
     data["meta"]["timestamp"] = datetime.datetime.utcnow().isoformat()
 
-    # Find the main document request to get status and headers
-    main_request = next((r for r in reversed(driver.requests) if r.url == data["meta"]["final_url"] and r.response), None)
-    if main_request:
-        data["meta"]["status"] = main_request.response.status_code
-        
-        # --- Security Headers ---
-        headers_to_check = ['content-security-policy', 'x-frame-options', 'x-content-type-options', 
-                            'strict-transport-security', 'referrer-policy', 'access-control-allow-origin', 'set-cookie']
-        for header in headers_to_check:
-            if header in main_request.response.headers:
-                data["security_headers"][header] = main_request.response.headers[header]
+    # Find the main document request to get status and headers (only if selenium-wire is available)
+    if SELENIUM_WIRE_AVAILABLE and hasattr(driver, 'requests'):
+        try:
+            main_request = next((r for r in reversed(driver.requests) if r.url == data["meta"]["final_url"] and r.response), None)
+            if main_request:
+                data["meta"]["status"] = main_request.response.status_code
+                
+                # --- Security Headers ---
+                headers_to_check = ['content-security-policy', 'x-frame-options', 'x-content-type-options', 
+                                    'strict-transport-security', 'referrer-policy', 'access-control-allow-origin', 'set-cookie']
+                for header in headers_to_check:
+                    if header in main_request.response.headers:
+                        data["security_headers"][header] = main_request.response.headers[header]
+        except Exception as e:
+            print(f"Could not retrieve network data from selenium-wire: {e}")
+            data["meta"]["status"] = 200  # Default assumption
+    else:
+        data["meta"]["status"] = 200  # Default assumption when selenium-wire is not available
 
     # --- Storage Keys ---
     try:
@@ -129,24 +159,27 @@ def collect_browser_data(driver: webdriver.Chrome, initial_url: str, config: Cra
         print(f"Could not retrieve storage keys: {e}")
 
     # --- Network Summary (HAR-lite) ---
-    for request in driver.requests:
-        if request.response:
-            net_entry = {
-                "url": request.url,
-                "method": request.method,
-                "status": request.response.status_code,
-                "mime_type": request.response.headers.get('Content-Type', 'N/A'),
-                "cors": 'access-control-allow-origin' in request.response.headers
-            }
-            # Capture and mask response body sample (up to 1KB)
-            if request.response.body:
-                body_sample = request.response.body[:1024].decode('utf-8', 'ignore')
-                # Simple masking example (can be enhanced with the regex)
-                if "password" in body_sample or "token" in body_sample:
-                     body_sample = config.masking_replacement
-                net_entry["body_sample"] = body_sample
-
-            data["network_summary"].append(net_entry)
+    if SELENIUM_WIRE_AVAILABLE and hasattr(driver, 'requests'):
+        try:
+            for request in driver.requests:
+                if request.response:
+                    net_entry = {
+                        "url": request.url,
+                        "method": request.method,
+                        "status": request.response.status_code,
+                        "mime_type": request.response.headers.get('Content-Type', 'N/A'),
+                        "cors": 'access-control-allow-origin' in request.response.headers
+                    }
+                    if request.response.body:
+                        body_sample = request.response.body[:1024].decode('utf-8', 'ignore')
+                        if "password" in body_sample or "token" in body_sample:
+                            body_sample = config.masking_replacement
+                        net_entry["body_sample"] = body_sample
+                    data["network_summary"].append(net_entry)
+        except Exception as e:  # noqa: BLE001
+            print(f"[crawler] network capture partial failure: {e}")
+    else:
+        data["network_summary_note"] = "selenium-wire not available; network capture skipped"
 
     return data
 
