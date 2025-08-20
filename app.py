@@ -36,3 +36,8 @@ def crawl():
 
     status_code = 200 if "error" not in result else 500
     return jsonify(result), status_code
+
+
+# 로컬 개발 실행
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
