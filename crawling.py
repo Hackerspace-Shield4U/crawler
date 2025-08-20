@@ -1,11 +1,43 @@
 import re
 import json
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup, Comment
-
 
 # Assuming you import the necessary classes and functions from 'crawler_config.py'
 from crawler_config import CrawlerConfig, setup_driver_session, collect_browser_data
+
+
+_PATH_KV_PAT = re.compile(r'([a-zA-Z0-9_\-]+)=([^/]+)')
+
+def _parse_url_structured(base_url: str, raw_url: str) -> dict:
+    """Makes the original URL absolute and structures it by component."""
+    abs_url = urljoin(base_url, raw_url)
+    p = urlparse(abs_url)
+    query_dict = {k: v for k, v in parse_qs(p.query, keep_blank_values=True).items()}
+    # Also extracts key=value segments from the path (e.g., /k=..., /m=a,b,c)
+    path_params = {}
+    for seg in (p.path or "/").split('/'):
+        m = _PATH_KV_PAT.fullmatch(seg)
+        if m:
+            val = m.group(2)
+            path_params[m.group(1)] = val.split(',') if ',' in val else val
+    data = {
+        "full": abs_url,
+        "scheme": p.scheme,
+        "host": p.hostname,
+        "path": p.path or "/",
+        "query": query_dict,          # Empty dict if no query
+        "fragment": p.fragment or ""
+    }
+    if path_params:
+        data["path_params"] = path_params
+    return data
+
+def _as_structured_list(base_url: str, urls: list[str]) -> list[dict]:
+    """Converts a list of URL strings into a list of structured dictionaries (with duplicates removed)."""
+    dedup = list(dict.fromkeys(urls))  # Deduplicate while preserving order
+    return [_parse_url_structured(base_url, u) for u in dedup]
+
 
 class PageParser:
     """
@@ -40,6 +72,13 @@ class PageParser:
             })
 
         # 3. Scripts & Links (CSS)
+        def parse_url(u):
+            parsed = urlparse(urljoin(self.base_url, u))
+            return {
+                "full": parsed.geturl(),
+                "path": parsed.path,
+                "query": parse_qs(parsed.query)
+            }
         scripts = [urljoin(self.base_url, s.get('src')) for s in self.soup.find_all('script') if s.get('src')]
         links = [urljoin(self.base_url, l.get('href')) for l in self.soup.find_all('link') if l.get('href')]
 
@@ -63,8 +102,8 @@ class PageParser:
         return {
             "title": title,
             "meta": meta_tags,
-            "scripts": list(set(scripts)), # Remove duplicates
-            "links": list(set(links)),
+            "scripts": scripts,
+            "links": links,
             "visible_links": list(set(visible_links)),
             "forms": forms,
             "comments_or_text_leaks": list(set(comments + text_leaks)),
@@ -194,14 +233,3 @@ def crawl_and_parse(api_input: dict) -> dict:
         print(f"Cleaned up session for {target_url}")
 
     return result
-
-if __name__ == "__main__":
-    api_input = {
-        "target_url": "https://google.com",
-        "cookies": {},
-        "max_depth": 3,
-    }
-
-    result = crawl_and_parse(api_input)
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
