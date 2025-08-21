@@ -138,7 +138,8 @@ def crawl():  # noqa: D401
       "parent_guid": "<uuid>",        # required
       "target_url": "https://...",    # required
       "cookies": {"sid":"abc"},      # optional
-      "max_depth": 2,                  # optional
+      "max_depth": 2,                  # optional (legacy)
+      "remaining_depth": 2,            # optional (preferred)
       "current_depth": 0               # optional
     }
     Returns 200 immediately after accepting task, real result via callback.
@@ -158,6 +159,7 @@ def crawl():  # noqa: D401
         "target_url": payload["target_url"],
         "cookies": payload.get("cookies", {}),
         "max_depth": int(payload.get("max_depth", 0)),
+        "remaining_depth": int(payload.get("remaining_depth", payload.get("max_depth", 0))),
         "current_depth": int(payload.get("current_depth", 0)),
     }
 

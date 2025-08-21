@@ -44,9 +44,10 @@ class PageParser:
     A class that uses BeautifulSoup to parse HTML page source and extract data
     according to a defined structure.
     """
-    def __init__(self, base_url: str, page_source: str):
+    def __init__(self, base_url: str, page_source: str, collect_links: bool = True):
         self.base_url = base_url
         self.soup = BeautifulSoup(page_source, 'html.parser')
+        self.collect_links = collect_links
 
     def parse_all(self) -> dict:
         """Executes all parsing methods and consolidates the results."""
@@ -73,12 +74,15 @@ class PageParser:
                 else:
                     meta_dict[name] = content
 
-        # 3. Scripts & Links (CSS)
+        # 3. Scripts & Links (CSS)  
         scripts = [urljoin(self.base_url, s.get('src')) for s in self.soup.find_all('script') if s.get('src')]
         links = [urljoin(self.base_url, l.get('href')) for l in self.soup.find_all('link') if l.get('href')]
 
-        # 4. Visible Links
-        visible_links = [urljoin(self.base_url, a.get('href')) for a in self.soup.find_all('a') if a.get('href')]
+        # 4. Visible Links - only collect if we need them for further crawling
+        if self.collect_links:
+            visible_links = [urljoin(self.base_url, a.get('href')) for a in self.soup.find_all('a') if a.get('href')]
+        else:
+            visible_links = []  # Don't collect links if max_depth is 0
         
         # 5. Forms - format to match LLM spec
         forms = []
@@ -312,7 +316,9 @@ def crawl_and_parse(api_input: dict) -> dict:
     parent_guid = api_input["parent_guid"]
     target_url = api_input["target_url"]
     cookies = api_input.get("cookies", {})
-    max_depth = api_input.get("max_depth", 0)
+    max_depth = api_input.get("max_depth", 0)  # Legacy, keep for backwards compatibility
+    remaining_depth = api_input.get("remaining_depth", max_depth)  # Use remaining_depth as primary
+    current_depth = api_input.get("current_depth", 0)
 
     # 1. Initialize crawler config and driver (using previous code)
     config = CrawlerConfig()
@@ -336,13 +342,17 @@ def crawl_and_parse(api_input: dict) -> dict:
         # 4. Pass the page source to the parser for analysis
         page_source = driver.page_source
         print(f"[DEBUG] Page source length: {len(page_source)}")
-        print(f"[DEBUG] Page source preview: {page_source[:500]}")
+        print(f"[DEBUG] Max depth: {max_depth}, Remaining depth: {remaining_depth}, Current depth: {current_depth}")
         
-        parser = PageParser(base_url=driver.current_url, page_source=page_source)
+        # Only collect links for further crawling if we have remaining depth > 0
+        collect_links_for_crawling = remaining_depth > 0
+        
+        parser = PageParser(base_url=driver.current_url, page_source=page_source, collect_links=collect_links_for_crawling)
         parsed_data = parser.parse_all()
         print(f"[DEBUG] Parsed data keys: {list(parsed_data.keys())}")
-        print(f"[DEBUG] DOM data: {parsed_data.get('dom', {})}")
-        print(f"[DEBUG] Fingerprints: {parsed_data.get('fingerprints', {})}")
+        print(f"[DEBUG] DOM data keys: {list(parsed_data.get('dom', {}).keys()) if parsed_data.get('dom') else []}")
+        print(f"[DEBUG] Links collected: {len(parsed_data.get('dom', {}).get('visible_links', []))}")
+        print(f"[DEBUG] Links will be processed with remaining_depth: {remaining_depth - 1}")
 
         # 5. Consolidate results in LLM-compatible format
         result = {
@@ -357,7 +367,9 @@ def crawl_and_parse(api_input: dict) -> dict:
                     "parent_guid": parent_guid,
                     "target_url": target_url,
                     "final_url": driver.current_url,
-                    "max_depth": max_depth
+                    "max_depth": max_depth,
+                    "remaining_depth": remaining_depth,
+                    "current_depth": current_depth
                 },
                 "browser_data": browser_data
             }
@@ -366,7 +378,19 @@ def crawl_and_parse(api_input: dict) -> dict:
 
     except Exception as e:
         print(f"An error occurred during crawling {target_url}: {e}")
-        result = {"error": str(e), "target_url": target_url}
+        result = {
+            "error": str(e), 
+            "target_url": target_url,
+            "_internal": {
+                "request_info": {
+                    "parent_guid": parent_guid,
+                    "target_url": target_url,
+                    "max_depth": max_depth,
+                    "remaining_depth": remaining_depth,
+                    "current_depth": current_depth
+                }
+            }
+        }
     finally:
         # 6. Clean up driver and temporary directory
         driver.quit()
